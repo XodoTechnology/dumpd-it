@@ -1,0 +1,43 @@
+services:
+  dumpd:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
+      # For built-in TLS (DOMAIN set) use these instead/additionally:
+      # - "80:80"
+      # - "443:443"
+    sysctls:
+      # allow the non-root process to bind :80/:443 for TLS mode
+      - net.ipv4.ip_unprivileged_port_start=0
+    environment:
+      # Comma-separated IPs/CIDRs allowed to upload. Downloads are open.
+      UPLOAD_ALLOW: "${UPLOAD_ALLOW:-127.0.0.1/32,::1/128}"
+      # Set true when behind a reverse proxy so client IP / proto come from
+      # X-Forwarded-For / X-Forwarded-Proto.
+      BEHIND_PROXY: "${BEHIND_PROXY:-false}"
+      # Optional public URL override, e.g. https://files.example.com
+      BASE_URL: "${BASE_URL:-}"
+      MAX_UPLOAD_MB: "${MAX_UPLOAD_MB:-10240}"
+      # Secret that bypasses the size cap via ?key= or X-Upload-Key header.
+      UNLOCK_KEY: "${UNLOCK_KEY:-}"
+      TTL: "${TTL:-168h}"
+      SWEEP_INTERVAL: "${SWEEP_INTERVAL:-10m}"
+
+      # ---- built-in TLS (no reverse proxy needed) ----
+      # Point your domain at this host, set it here, map 80+443, done.
+      # Certs are fetched from Let's Encrypt and auto-renewed.
+      DOMAIN: "${DOMAIN:-}"                 # e.g. files.example.com (comma-sep ok)
+      TLS_ADDR: "${TLS_ADDR:-:443}"
+      ACME_EMAIL: "${ACME_EMAIL:-}"         # optional, for expiry notices
+      ACME_STAGING: "${ACME_STAGING:-false}"# true while testing to avoid rate limits
+      # SELF_SIGNED: "true"                 # generate own cert instead of ACME
+      # Manual certs instead:
+      # CERT_FILE: /certs/fullchain.pem
+      # KEY_FILE: /certs/privkey.pem
+    volumes:
+      - dumpd-data:/data
+      # - ./certs:/certs:ro   # for CERT_FILE/KEY_FILE mode
+
+volumes:
+  dumpd-data:
