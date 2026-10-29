@@ -2,8 +2,9 @@
 #
 # dumpd installer for Debian 13 (trixie)
 #   - installs Docker CE + compose plugin (official repo)
+#   - domain-first: auto Let's Encrypt HTTPS on 80/443 (default)
+#   - falls back to self-signed HTTPS or plain HTTP if no domain
 #   - installs dumpd to $INSTALL_DIR, generates .env + docker-compose.yml
-#   - builds and starts the service
 #
 # Usage:
 #   git clone <repo> && cd dumpd-it && sudo bash install.sh
@@ -16,32 +17,31 @@ set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/dumpd}"
 
+# Your domain — point its A/AAAA record at this server. Comma-separated ok.
+# Set this and everything else (cert issuance, renewal, http->https redirect)
+# is automatic. You'll be prompted if left empty.
+DOMAIN="${DOMAIN:-}"
+# ACME_EMAIL="you@example.com"        # optional, Let's Encrypt notices
+ACME_EMAIL="${ACME_EMAIL:-}"
+# ACME_STAGING="true"                 # use while testing to avoid rate limits
+ACME_STAGING="${ACME_STAGING:-false}"
+# SELF_SIGNED="true"                  # force self-signed cert (no ACME)
+SELF_SIGNED="${SELF_SIGNED:-false}"
+
 # IPs/CIDRs allowed to UPLOAD (downloads are always open). Comma-separated.
 # Leave empty to be prompted (defaults to this SSH session's source IP).
 UPLOAD_ALLOW="${UPLOAD_ALLOW:-}"
-
-# --- Plain HTTP mode ------------------------------------------------------
-HTTP_PORT="${HTTP_PORT:-8080}"        # host port when running without TLS
-
-# --- Built-in TLS (auto Let's Encrypt). Uncomment + set DOMAIN ------------
-# DOMAIN="files.example.com"          # comma-separated list ok
-# ACME_EMAIL="you@example.com"        # optional, expiry notices
-# ACME_STAGING="true"                 # use while testing to avoid rate limits
-# SELF_SIGNED="true"                  # generate own cert instead of ACME
-DOMAIN="${DOMAIN:-}"
-ACME_EMAIL="${ACME_EMAIL:-}"
-ACME_STAGING="${ACME_STAGING:-false}"
-SELF_SIGNED="${SELF_SIGNED:-false}"
 
 # --- Optional knobs --------------------------------------------------------
 # UNLOCK_KEY="s3cret"                 # allows unlimited upload size via ?key=
 UNLOCK_KEY="${UNLOCK_KEY:-}"
 MAX_UPLOAD_MB="${MAX_UPLOAD_MB:-10240}"
 TTL="${TTL:-168h}"                    # rolling expiry, renewed on access
-# BASE_URL="https://files.example.com"  # override generated URLs
+# BASE_URL="https://files.example.com"  # override generated URLs (rarely needed)
 BASE_URL="${BASE_URL:-}"
-# BEHIND_PROXY="true"                 # if TLS terminated at a reverse proxy
+# BEHIND_PROXY="true"                 # only if you front dumpd with your own proxy
 BEHIND_PROXY="${BEHIND_PROXY:-false}"
+HTTP_PORT="${HTTP_PORT:-8080}"        # plain-HTTP fallback only (no domain, no TLS)
 
 ############################################################################
 
@@ -56,6 +56,39 @@ die() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -f "$SCRIPT_DIR/go.mod" && -f "$SCRIPT_DIR/Dockerfile" ]] \
     || die "run this script from the dumpd-it repo directory"
+
+############################ domain / TLS mode #############################
+if [[ -z "$DOMAIN" && "$SELF_SIGNED" != "true" && -t 0 ]]; then
+    suggested="$(hostname -f 2>/dev/null || true)"
+    [[ "$suggested" == *.* ]] || suggested=""
+    read -rp "Domain for auto-HTTPS (blank to skip)${suggested:+ [$suggested]}: " ans
+    DOMAIN="${ans:-$suggested}"
+fi
+if [[ -z "$DOMAIN" && "$SELF_SIGNED" != "true" && -t 0 ]]; then
+    read -rp "No domain set - serve HTTPS with a self-signed cert on :443? [Y/n]: " ans
+    case "${ans:-y}" in [Nn]*) ;; *) SELF_SIGNED="true";; esac
+fi
+TLS_MODE=""
+[[ -n "$DOMAIN" || "$SELF_SIGNED" == "true" ]] && TLS_MODE=1
+
+if [[ -n "$DOMAIN" ]]; then
+    first_domain="${DOMAIN%%,*}"
+    resolved="$(getent ahostsv4 "$first_domain" 2>/dev/null | awk 'NR==1{print $1}' || true)"
+    mine="$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
+    if [[ -z "$resolved" ]]; then
+        warn "$first_domain does not resolve - cert issuance will FAIL until DNS is set"
+    elif [[ -n "$mine" && "$resolved" != "$mine" ]]; then
+        warn "$first_domain resolves to $resolved but this host appears to be $mine"
+        warn "cert issuance will fail unless that host forwards 80/443 here"
+    else
+        c "DNS ok: $first_domain -> $resolved"
+    fi
+fi
+
+if [[ -n "$TLS_MODE" ]] && ss -tln 2>/dev/null | grep -qE ':(80|443) '; then
+    warn "something is already listening on 80/443 - cert issuance/redirect may fail:"
+    ss -tlnp 2>/dev/null | grep -E ':(80|443) ' | sed 's/^/    /' >&2 || true
+fi
 
 ########################## prompt: upload allowlist #########################
 if [[ -z "$UPLOAD_ALLOW" ]]; then
@@ -97,7 +130,11 @@ cp -f "$SCRIPT_DIR"/*.go "$SCRIPT_DIR"/go.mod "$SCRIPT_DIR"/go.sum \
       "$SCRIPT_DIR"/Dockerfile "$SCRIPT_DIR"/.dockerignore "$SCRIPT_DIR"/README.md \
       "$INSTALL_DIR"/ 2>/dev/null || true
 
-# .env — consumed by docker compose (env_file) and used for port templating
+# .env — passed to the container via env_file.
+# Back up any existing one first in case it was hand-edited.
+if [[ -f "$INSTALL_DIR/.env" ]] && ! cmp -s "$INSTALL_DIR/.env" /dev/null 2>/dev/null; then
+    cp -f "$INSTALL_DIR/.env" "$INSTALL_DIR/.env.bak"
+fi
 {
     echo "UPLOAD_ALLOW=$UPLOAD_ALLOW"
     echo "BEHIND_PROXY=$BEHIND_PROXY"
@@ -114,8 +151,8 @@ cp -f "$SCRIPT_DIR"/*.go "$SCRIPT_DIR"/go.mod "$SCRIPT_DIR"/go.sum \
 } > "$INSTALL_DIR/.env"
 chmod 600 "$INSTALL_DIR/.env"
 
-# compose: port layout depends on TLS mode
-if [[ -n "$DOMAIN" || "$SELF_SIGNED" == "true" ]]; then
+# compose: domain/self-signed -> serve 80+443 directly; else plain http port
+if [[ -n "$TLS_MODE" ]]; then
     PORTS=$'      - "80:80"\n      - "443:443"'
 else
     PORTS="      - \"${HTTP_PORT}:8080\""
@@ -139,7 +176,7 @@ YAML
 ############################### firewall ###################################
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
     c "ufw detected - opening required ports"
-    if [[ -n "$DOMAIN" || "$SELF_SIGNED" == "true" ]]; then
+    if [[ -n "$TLS_MODE" ]]; then
         ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null
     else
         ufw allow "$HTTP_PORT"/tcp >/dev/null
@@ -160,15 +197,22 @@ docker compose ps --format '  {{.Name}}  {{.Status}}  {{.Ports}}' || docker comp
 echo
 if [[ -n "$DOMAIN" ]]; then
     cat <<MSG
-  upload:   curl https://$DOMAIN -T file.tar.gz     (from $UPLOAD_ALLOW)
-  download: open the returned URL                   (any IP)
-  first TLS handshake may take ~30s while the cert is issued.
+  upload:   curl https://${DOMAIN%%,*} -T file.tar.gz      (from $UPLOAD_ALLOW)
+  download: open the returned URL                          (any IP)
+  the first https request may take ~30s while the cert is issued.
+MSG
+elif [[ "$SELF_SIGNED" == "true" ]]; then
+    host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    cat <<MSG
+  upload:   curl -k https://$host_ip -T file.tar.gz        (from $UPLOAD_ALLOW)
+  download: curl -kO <returned URL>                        (any IP)
+  self-signed cert: browsers will warn; use -k with curl.
 MSG
 else
     host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
     cat <<MSG
-  upload:   curl http://$host_ip:$HTTP_PORT -T file.tar.gz   (from $UPLOAD_ALLOW)
-  download: open the returned URL                            (any IP)
+  upload:   curl http://$host_ip:$HTTP_PORT -T file.tar.gz (from $UPLOAD_ALLOW)
+  download: open the returned URL                          (any IP)
 MSG
 fi
 cat <<MSG

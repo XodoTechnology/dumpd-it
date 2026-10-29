@@ -15,14 +15,19 @@ A tiny, secure, curl-friendly file drop — like bashupload, but self-hosted.
 sudo bash install.sh
 ```
 
-Installs Docker CE + compose plugin, deploys to `/opt/dumpd`, generates
-`.env`/`docker-compose.yml` for you, builds and starts the service. Edit the
-CONFIG block at the top of `install.sh` (uncomment `DOMAIN=` for auto TLS,
-`UNLOCK_KEY=`, etc.) or export the vars before running.
+Installs Docker CE + compose plugin, asks for your **domain** (default path:
+direct Let's Encrypt HTTPS on 80/443 — no proxy needed), your upload IP
+(defaults to your current SSH source IP), deploys to `/opt/dumpd`, builds and
+starts the service. No domain? It offers self-signed HTTPS on :443, else falls
+back to plain HTTP on `HTTP_PORT` (8080). Config lives in the commented CONFIG
+block at the top of `install.sh`, or in `/opt/dumpd/.env` afterwards.
 
-## Quick start (plain HTTP, manual)
+## Quick start (manual)
 
 ```sh
+# domain mode: point DNS here first
+DOMAIN=files.example.com UPLOAD_ALLOW="1.2.3.4/32" docker compose up -d --build
+# or plain http:
 docker compose up -d --build
 curl http://localhost:8080 -T backup.tar.gz
 # -> http://localhost:8080/d/AbCdEfGhIjK/backup.tar.gz
@@ -75,6 +80,17 @@ Without the key, `MAX_UPLOAD_MB` applies (default 10240 = 10 GB).
 | `TTL`            | `168h`    | Lifetime, renewed on every access (Go duration).   |
 | `SWEEP_INTERVAL` | `10m`     | Expired-file purge interval.                       |
 | `DATA_DIR`       | `/data`   | Storage (blobs, meta, certs) — volume-mount it.    |
+
+## Reinstalling / updating / wiping
+
+```sh
+sudo bash install.sh                      # re-run: updates code + rebuilds (data kept)
+cd /opt/dumpd && docker compose down -v   # stop + delete stored files/certs
+rm -rf /opt/dumpd                         # remove install entirely
+```
+
+Re-running `install.sh` regenerates `.env` from the CONFIG block / exported
+vars — a copy of the previous one is saved as `.env.bak`.
 
 ## Deployment notes
 
