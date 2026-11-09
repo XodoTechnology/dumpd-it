@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -64,6 +65,8 @@ func newToken(nbytes int) string {
 func (s *store) blobPath(id string) string { return filepath.Join(s.blobDir, id) }
 func (s *store) metaPath(id string) string { return filepath.Join(s.metaDir, id+".json") }
 
+var errCorruptMeta = errors.New("corrupt meta file")
+
 func (s *store) loadMeta(id string) (*Meta, error) {
 	if !validID(id) {
 		return nil, fmt.Errorf("bad id")
@@ -74,7 +77,7 @@ func (s *store) loadMeta(id string) (*Meta, error) {
 	}
 	var m Meta
 	if err := json.Unmarshal(b, &m); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %s", errCorruptMeta, err)
 	}
 	return &m, nil
 }
@@ -91,6 +94,11 @@ func (s *store) writeMeta(m *Meta) error {
 		return err
 	}
 	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		os.Remove(tmp.Name())
 		return err
@@ -118,8 +126,24 @@ func (s *store) delete(id string) {
 	os.Remove(s.metaPath(id))
 }
 
-// sweep removes expired files; returns number removed.
+const (
+	// orphanGrace keeps freshly-written blobs safe from the orphan sweeper:
+	// an upload renames the blob into place a moment before writeMeta lands.
+	orphanGrace = 10 * time.Minute
+	// tmpMaxAge reclaims temp files left behind by uploads killed mid-write.
+	tmpMaxAge = 24 * time.Hour
+)
+
+// sweep removes expired files, corrupt metas, orphaned blobs and stale temp
+// files; returns the number of filesystem entries removed.
 func (s *store) sweep(now time.Time) int {
+	n := s.sweepMeta(now)
+	n += s.sweepBlobs(now)
+	n += s.sweepTmp(now)
+	return n
+}
+
+func (s *store) sweepMeta(now time.Time) int {
 	ents, err := os.ReadDir(s.metaDir)
 	if err != nil {
 		return 0
@@ -131,8 +155,64 @@ func (s *store) sweep(now time.Time) int {
 			continue
 		}
 		m, err := s.loadMeta(id)
-		if err != nil || now.After(m.Expires) {
-			s.delete(id)
+		switch {
+		case err == nil && !now.After(m.Expires):
+			continue
+		case err != nil && !errors.Is(err, errCorruptMeta) && !os.IsNotExist(err):
+			// transient failure (permissions, EMFILE, ...): keep and retry next tick
+			logLine("sweep: keeping %s: %v", id, err)
+			continue
+		}
+		s.delete(id)
+		n++
+	}
+	return n
+}
+
+// sweepBlobs removes blobs that have no meta file (crash between blob rename
+// and meta write, or manual meta deletion). Entries younger than orphanGrace
+// are left alone to cover the upload rename window.
+func (s *store) sweepBlobs(now time.Time) int {
+	ents, err := os.ReadDir(s.blobDir)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(s.metaPath(e.Name())); err == nil {
+			continue // meta exists
+		} else if !os.IsNotExist(err) {
+			continue // can't tell - keep
+		}
+		if fi, err := e.Info(); err != nil || now.Sub(fi.ModTime()) < orphanGrace {
+			continue
+		}
+		if os.Remove(s.blobPath(e.Name())) == nil {
+			n++
+		}
+	}
+	return n
+}
+
+// sweepTmp removes temp files abandoned by uploads that died mid-write.
+func (s *store) sweepTmp(now time.Time) int {
+	ents, err := os.ReadDir(s.tmpDir)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		fi, err := e.Info()
+		if err != nil || now.Sub(fi.ModTime()) < tmpMaxAge {
+			continue
+		}
+		if os.Remove(filepath.Join(s.tmpDir, e.Name())) == nil {
 			n++
 		}
 	}

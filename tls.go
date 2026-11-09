@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,7 +32,10 @@ func (s *server) tlsConfig() (*tls.Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("load cert: %w", err)
 		}
-		return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
+		return &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}, nil
 
 	case len(s.cfg.Domains) > 0 && !s.cfg.SelfSigned:
 		cacheDir := filepath.Join(s.cfg.DataDir, "acme")
@@ -49,7 +53,11 @@ func (s *server) tlsConfig() (*tls.Config, error) {
 		}
 		s.acme = m
 		logLine("ACME (Let's Encrypt) enabled for: %s", strings.Join(s.cfg.Domains, ", "))
-		return &tls.Config{GetCertificate: m.GetCertificate}, nil
+		// TLSConfig() supplies GetCertificate plus h2 and the ACME ALPN
+		// protocol needed for tls-alpn-01 challenges.
+		tc := m.TLSConfig()
+		tc.MinVersion = tls.VersionTLS12
+		return tc, nil
 
 	default:
 		cert, err := loadOrCreateSelfSigned(s.cfg.DataDir, s.cfg.Domains)
@@ -57,18 +65,45 @@ func (s *server) tlsConfig() (*tls.Config, error) {
 			return nil, fmt.Errorf("self-signed cert: %w", err)
 		}
 		logLine("using self-signed certificate")
-		return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
+		return &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}, nil
 	}
 }
 
+// tlsPort extracts the port from a listen address like ":443" or "0.0.0.0:8443".
+func tlsPort(addr string) string {
+	if _, p, err := net.SplitHostPort(strings.TrimSpace(addr)); err == nil && p != "" {
+		return p
+	}
+	a := strings.TrimPrefix(strings.TrimSpace(addr), ":")
+	if _, err := strconv.Atoi(a); err == nil {
+		return a
+	}
+	return "443"
+}
+
+// httpsURL builds the https counterpart of the current request, using the
+// canonical public host and the configured TLS port.
+func (s *server) httpsURL(r *http.Request) string {
+	host, _ := splitHostPortLoose(s.publicHost(r))
+	if p := tlsPort(s.cfg.TLSAddr); p != "" && p != "443" {
+		host = net.JoinHostPort(host, p)
+	}
+	return "https://" + host + r.URL.RequestURI()
+}
+
 // httpFallback answers /healthz directly, satisfies ACME http-01 challenges
-// when a manager is active, and redirects everything else to https.
+// when a manager is active, and redirects everything else to https. The
+// redirect is a 308 so methods and bodies (uploads) survive the hop.
 func (s *server) httpFallback() http.Handler {
-	var inner http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "https://"+r.Host+r.URL.RequestURI(), http.StatusMovedPermanently)
+	redirect := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, s.httpsURL(r), http.StatusPermanentRedirect)
 	})
+	var inner http.Handler = redirect
 	if s.acme != nil {
-		inner = s.acme.HTTPHandler(nil)
+		inner = s.acme.HTTPHandler(redirect)
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" {

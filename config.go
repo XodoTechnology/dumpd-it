@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net/netip"
 	"os"
 	"strconv"
@@ -10,38 +11,53 @@ import (
 )
 
 type Config struct {
-	Addr        string
-	TLSAddr     string
-	DataDir     string
-	BaseURL     string
-	AllowNets   []netip.Prefix
-	BehindProxy bool
-	MaxUpload   int64
-	UnlockKey   string
-	TTL         time.Duration
-	SweepEvery  time.Duration
-	CertFile    string
-	KeyFile     string
-	Domains     []string
-	SelfSigned  bool
-	ACMEStaging bool
-	ACMEEmail   string
+	Addr         string
+	TLSAddr      string
+	DataDir      string
+	BaseURL      string
+	AllowNets    []netip.Prefix
+	BehindProxy  bool
+	ProxyHops    int
+	MaxUpload    int64
+	MinFreeBytes int64
+	UnlockKey    string
+	TTL          time.Duration
+	SweepEvery   time.Duration
+	CertFile     string
+	KeyFile      string
+	Domains      []string
+	SelfSigned   bool
+	ACMEStaging  bool
+	ACMEEmail    string
 }
 
 func loadConfig() (*Config, error) {
+	// bound the MB values before shifting to bytes so huge inputs can't
+	// wrap int64 into a small positive cap
+	maxMB := envInt64("MAX_UPLOAD_MB", 10240)
+	minMB := envInt64("MIN_FREE_MB", 1024)
+	if maxMB <= 0 || maxMB > 1<<40 {
+		return nil, fmt.Errorf("MAX_UPLOAD_MB out of range (1..%d)", int64(1)<<40)
+	}
+	if minMB < 0 || minMB > 1<<40 {
+		return nil, fmt.Errorf("MIN_FREE_MB out of range (0..%d)", int64(1)<<40)
+	}
+
 	c := &Config{
-		DataDir:     envStr("DATA_DIR", "./data"),
-		TLSAddr:     envStr("TLS_ADDR", ":443"),
-		BaseURL:     strings.TrimRight(os.Getenv("BASE_URL"), "/"),
-		BehindProxy: envBool("BEHIND_PROXY", false),
-		MaxUpload:   envInt64("MAX_UPLOAD_MB", 10240) << 20,
-		UnlockKey:   os.Getenv("UNLOCK_KEY"),
-		SweepEvery:  envDur("SWEEP_INTERVAL", 10*time.Minute),
-		CertFile:    os.Getenv("CERT_FILE"),
-		KeyFile:     os.Getenv("KEY_FILE"),
-		SelfSigned:  envBool("SELF_SIGNED", false),
-		ACMEStaging: envBool("ACME_STAGING", false),
-		ACMEEmail:   os.Getenv("ACME_EMAIL"),
+		DataDir:      envStr("DATA_DIR", "./data"),
+		TLSAddr:      envStr("TLS_ADDR", ":443"),
+		BaseURL:      strings.TrimRight(os.Getenv("BASE_URL"), "/"),
+		BehindProxy:  envBool("BEHIND_PROXY", false),
+		ProxyHops:    int(envInt64("PROXY_HOPS", 1)),
+		MaxUpload:    maxMB << 20,
+		MinFreeBytes: minMB << 20,
+		UnlockKey:    os.Getenv("UNLOCK_KEY"),
+		SweepEvery:   envDur("SWEEP_INTERVAL", 10*time.Minute),
+		CertFile:     os.Getenv("CERT_FILE"),
+		KeyFile:      os.Getenv("KEY_FILE"),
+		SelfSigned:   envBool("SELF_SIGNED", false),
+		ACMEStaging:  envBool("ACME_STAGING", false),
+		ACMEEmail:    os.Getenv("ACME_EMAIL"),
 	}
 
 	for _, d := range strings.Split(os.Getenv("DOMAIN"), ",") {
@@ -62,8 +78,11 @@ func loadConfig() (*Config, error) {
 	if c.TTL <= 0 {
 		return nil, fmt.Errorf("TTL must be positive")
 	}
-	if c.MaxUpload <= 0 {
-		return nil, fmt.Errorf("MAX_UPLOAD_MB must be positive")
+	if c.SweepEvery <= 0 {
+		return nil, fmt.Errorf("SWEEP_INTERVAL must be positive")
+	}
+	if c.ProxyHops < 1 || c.ProxyHops > 16 {
+		return nil, fmt.Errorf("PROXY_HOPS must be between 1 and 16")
 	}
 
 	for _, tok := range strings.Split(os.Getenv("UPLOAD_ALLOW"), ",") {
@@ -99,6 +118,7 @@ func envBool(k string, def bool) bool {
 		if b, err := strconv.ParseBool(v); err == nil {
 			return b
 		}
+		log.Printf("config: invalid %s=%q, using default %v", k, v, def)
 	}
 	return def
 }
@@ -108,6 +128,7 @@ func envInt64(k string, def int64) int64 {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return n
 		}
+		log.Printf("config: invalid %s=%q, using default %d", k, v, def)
 	}
 	return def
 }
@@ -117,6 +138,7 @@ func envDur(k string, def time.Duration) time.Duration {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
 		}
+		log.Printf("config: invalid %s=%q, using default %s", k, v, def)
 	}
 	return def
 }

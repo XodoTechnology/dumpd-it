@@ -1,5 +1,10 @@
 .git
+.gitignore
 data
 *.md
 docker-compose.yml
 .dockerignore
+.env
+.env.*
+*_test.go
+install.sh

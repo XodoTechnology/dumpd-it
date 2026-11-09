@@ -1,11 +1,17 @@
 package main
 
 import (
-	"golang.org/x/crypto/acme/autocert"
+	"context"
+	"errors"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
+
+	"golang.org/x/crypto/acme/autocert"
 )
 
 type server struct {
@@ -36,6 +42,31 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(b)
 	w.bytes += n
 	return n, err
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// Flush delegates to the underlying writer when it supports flushing.
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// ReadFrom preserves zero-copy paths (e.g. sendfile) of the underlying
+// writer while still counting bytes for the request log.
+func (w *statusWriter) ReadFrom(r io.Reader) (int64, error) {
+	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		n, err := rf.ReadFrom(r)
+		w.bytes += int(n)
+		if w.status == 0 {
+			w.status = http.StatusOK
+		}
+		return n, err
+	}
+	// io.Copy would recurse through ReadFrom; hide it behind a Writer-only view.
+	return io.Copy(struct{ io.Writer }{w}, r)
 }
 
 func (s *server) logMiddleware(next http.Handler) http.Handler {
@@ -80,17 +111,20 @@ func main() {
 		s.store.sweep(time.Now())
 		for range time.Tick(cfg.SweepEvery) {
 			if n := s.store.sweep(time.Now()); n > 0 {
-				logLine("sweeper removed %d expired file(s)", n)
+				logLine("sweeper removed %d item(s)", n)
 			}
 		}
 	}()
+
+	var primary *http.Server
+	var extras []*http.Server
 
 	if len(cfg.Domains) > 0 || cfg.CertFile != "" || cfg.SelfSigned {
 		tlsCfg, err := s.tlsConfig()
 		if err != nil {
 			log.Fatalf("tls: %v", err)
 		}
-		srv := &http.Server{
+		primary = &http.Server{
 			Addr:              cfg.TLSAddr,
 			Handler:           s.logMiddleware(mux),
 			TLSConfig:         tlsCfg,
@@ -98,29 +132,60 @@ func main() {
 			IdleTimeout:       120 * time.Second,
 		}
 		if cfg.Addr != "" && cfg.Addr != "off" {
+			hs := &http.Server{
+				Addr:              cfg.Addr,
+				Handler:           s.logMiddleware(s.httpFallback()),
+				ReadHeaderTimeout: 30 * time.Second,
+				IdleTimeout:       120 * time.Second,
+			}
+			extras = append(extras, hs)
 			go func() {
-				hs := &http.Server{
-					Addr:              cfg.Addr,
-					Handler:           s.logMiddleware(s.httpFallback()),
-					ReadHeaderTimeout: 30 * time.Second,
-					IdleTimeout:       120 * time.Second,
-				}
 				log.Printf("http on %s (acme-challenge + https redirect)", cfg.Addr)
-				if err := hs.ListenAndServe(); err != nil {
+				if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 					logLine("http listener: %v", err)
 				}
 			}()
 		}
 		log.Printf("listening TLS on %s, data=%s ttl=%s", cfg.TLSAddr, cfg.DataDir, cfg.TTL)
-		log.Fatal(srv.ListenAndServeTLS("", ""))
+	} else {
+		primary = &http.Server{
+			Addr:              cfg.Addr,
+			Handler:           s.logMiddleware(mux),
+			ReadHeaderTimeout: 30 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		}
+		log.Printf("listening on %s, data=%s ttl=%s maxupload=%d", cfg.Addr, cfg.DataDir, cfg.TTL, cfg.MaxUpload)
 	}
 
-	srv := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           s.logMiddleware(mux),
-		ReadHeaderTimeout: 30 * time.Second,
-		IdleTimeout:       120 * time.Second,
+	servers := append([]*http.Server{primary}, extras...)
+	errCh := make(chan error, 1)
+	go func() {
+		var err error
+		if primary.TLSConfig != nil {
+			err = primary.ListenAndServeTLS("", "")
+		} else {
+			err = primary.ListenAndServe()
+		}
+		errCh <- err
+	}()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	select {
+	case <-ctx.Done():
+		log.Printf("shutting down")
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("serve: %v", err)
+		}
 	}
-	log.Printf("listening on %s, data=%s ttl=%s maxupload=%d", cfg.Addr, cfg.DataDir, cfg.TTL, cfg.MaxUpload)
-	log.Fatal(srv.ListenAndServe())
+
+	sctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	for _, srv := range servers {
+		if err := srv.Shutdown(sctx); err != nil {
+			logLine("shutdown %s: %v", srv.Addr, err)
+		}
+	}
 }

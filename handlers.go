@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -59,27 +60,106 @@ func contentType(name string) string {
 	return "application/octet-stream"
 }
 
+// qvalue extracts the q= weight from Accept* parameter lists; absent means 1.
+func qvalue(params []string) float64 {
+	q := 1.0
+	for _, p := range params {
+		p = strings.TrimSpace(p)
+		if strings.HasPrefix(p, "q=") {
+			if v, err := strconv.ParseFloat(p[2:], 64); err == nil {
+				q = v
+			}
+		}
+	}
+	return q
+}
+
 func acceptsGzip(r *http.Request) bool {
 	for _, tok := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
-		tok = strings.TrimSpace(strings.SplitN(tok, ";", 2)[0])
-		if tok == "gzip" || tok == "*" {
+		parts := strings.Split(tok, ";")
+		coding := strings.TrimSpace(parts[0])
+		if !strings.EqualFold(coding, "gzip") && coding != "*" {
+			continue
+		}
+		if qvalue(parts[1:]) > 0 {
 			return true
 		}
 	}
 	return false
 }
 
+// accepts reports whether the Accept header explicitly lists the media type
+// with a non-zero q-value.
+func accepts(r *http.Request, want string) bool {
+	for _, part := range strings.Split(r.Header.Get("Accept"), ",") {
+		mt, params, err := mime.ParseMediaType(strings.TrimSpace(part))
+		if err != nil || mt != want {
+			continue
+		}
+		if qs, ok := params["q"]; ok {
+			if v, err := strconv.ParseFloat(qs, 64); err == nil && v <= 0 {
+				continue
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func acceptsJSON(r *http.Request) bool { return accepts(r, "application/json") }
+
+// etagMatches implements weak If-None-Match comparison against a bare hex
+// entity tag (the file's SHA-256).
+func etagMatches(header, sha string) bool {
+	for _, cand := range strings.Split(header, ",") {
+		cand = strings.TrimSpace(cand)
+		cand = strings.TrimPrefix(cand, "W/")
+		cand = strings.Trim(cand, `"`)
+		if cand == "*" || cand == sha {
+			return true
+		}
+	}
+	return false
+}
+
+// constTimeEq compares secrets in constant time regardless of length by
+// hashing both sides to fixed-size digests first.
+func constTimeEq(a, b string) bool {
+	da := sha256.Sum256([]byte(a))
+	db := sha256.Sum256([]byte(b))
+	return subtle.ConstantTimeCompare(da[:], db[:]) == 1
+}
+
+// normalizeIP canonicalizes an IP string (Unmap folds IPv4-mapped IPv6).
+func normalizeIP(s string) string {
+	if a, err := netip.ParseAddr(s); err == nil {
+		return a.Unmap().String()
+	}
+	return s
+}
+
 func (s *server) clientIP(r *http.Request) string {
 	if s.cfg.BehindProxy {
+		// XFF reads "client, proxy1, proxy2, ..." left to right; each trusted
+		// proxy appends the peer it saw. Entries a client supplies land on the
+		// left, so the trustworthy one sits ProxyHops entries from the right.
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			return strings.TrimSpace(strings.SplitN(xff, ",", 2)[0])
+			parts := strings.Split(xff, ",")
+			i := len(parts) - s.cfg.ProxyHops
+			if i < 0 {
+				i = 0
+			}
+			return normalizeIP(strings.TrimSpace(parts[i]))
+		}
+		if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); xrip != "" {
+			return normalizeIP(xrip)
 		}
 	}
 	ap, err := netip.ParseAddrPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
 	}
-	return ap.Addr().String()
+	return ap.Addr().Unmap().String()
 }
 
 func (s *server) uploadAllowed(ip string) bool {
@@ -87,12 +167,46 @@ func (s *server) uploadAllowed(ip string) bool {
 	if err != nil {
 		return false
 	}
+	a = a.Unmap()
 	for _, n := range s.cfg.AllowNets {
 		if n.Contains(a) {
 			return true
 		}
 	}
 	return false
+}
+
+// splitHostPortLoose splits host[:port], tolerating a missing port and
+// bracketed IPv6 literals.
+func splitHostPortLoose(hp string) (host, port string) {
+	if h, p, err := net.SplitHostPort(hp); err == nil {
+		return h, p
+	}
+	return strings.TrimPrefix(strings.TrimSuffix(hp, "]"), "["), ""
+}
+
+// publicHost picks the host[:port] to advertise in generated URLs. IP
+// literals, localhost and configured domains are taken from the request;
+// anything else falls back to the first DOMAIN so a spoofed Host header
+// can't poison download/delete URLs.
+func (s *server) publicHost(r *http.Request) string {
+	host, port := splitHostPortLoose(r.Host)
+	if ip := net.ParseIP(host); ip != nil || strings.EqualFold(host, "localhost") {
+		return r.Host
+	}
+	for _, d := range s.cfg.Domains {
+		if strings.EqualFold(host, d) {
+			return r.Host
+		}
+	}
+	if len(s.cfg.Domains) > 0 {
+		// canonicalize to the configured domain, preserving odd ports
+		if port != "" && port != "80" && port != "443" {
+			return net.JoinHostPort(s.cfg.Domains[0], port)
+		}
+		return s.cfg.Domains[0]
+	}
+	return r.Host
 }
 
 func (s *server) baseURL(r *http.Request) string {
@@ -103,11 +217,13 @@ func (s *server) baseURL(r *http.Request) string {
 	if r.TLS != nil {
 		scheme = "https"
 	} else if s.cfg.BehindProxy {
-		if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
-			scheme = strings.SplitN(p, ",", 2)[0]
+		// rightmost entry is the one our trusted proxy set
+		parts := strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")
+		if p := strings.TrimSpace(parts[len(parts)-1]); strings.EqualFold(p, "https") {
+			scheme = "https"
 		}
 	}
-	return scheme + "://" + r.Host
+	return scheme + "://" + s.publicHost(r)
 }
 
 // uploadLimit returns the byte cap for this request; 0 means unlimited
@@ -118,7 +234,7 @@ func (s *server) uploadLimit(r *http.Request) int64 {
 		if k == "" {
 			k = r.Header.Get("X-Upload-Key")
 		}
-		if k != "" && subtle.ConstantTimeCompare([]byte(k), []byte(s.cfg.UnlockKey)) == 1 {
+		if k != "" && constTimeEq(k, s.cfg.UnlockKey) {
 			return 0
 		}
 	}
@@ -147,11 +263,21 @@ func (s *server) healthz(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok\n"))
 }
 
+// multipartSlack is the headroom added on top of the file cap when limiting
+// the whole multipart body: boundaries, part headers and extra form fields.
+const multipartSlack = 8 << 20
+
 func (s *server) upload(w http.ResponseWriter, r *http.Request) {
 	ip := s.clientIP(r)
 	if !s.uploadAllowed(ip) {
 		http.Error(w, "upload not permitted from your IP\n", http.StatusForbidden)
 		return
+	}
+	if s.cfg.MinFreeBytes > 0 {
+		if free, err := s.store.freeBytes(); err == nil && free < s.cfg.MinFreeBytes {
+			http.Error(w, "insufficient disk space\n", http.StatusInsufficientStorage)
+			return
+		}
 	}
 
 	var name string
@@ -159,8 +285,11 @@ func (s *server) upload(w http.ResponseWriter, r *http.Request) {
 	var err error
 	limit := s.uploadLimit(r)
 
-	ct := r.Header.Get("Content-Type")
-	if strings.HasPrefix(ct, "multipart/form-data") {
+	mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if mt == "multipart/form-data" {
+		if limit > 0 {
+			r.Body = http.MaxBytesReader(w, r.Body, limit+multipartSlack)
+		}
 		name, meta, err = s.saveMultipart(w, r, limit)
 	} else {
 		name = sanitizeName(r.URL.Query().Get("filename"))
@@ -177,12 +306,15 @@ func (s *server) upload(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		var mbe *http.MaxBytesError
-		if errors.As(err, &mbe) || errors.Is(err, errTooLarge) {
+		switch {
+		case errors.As(err, &mbe) || errors.Is(err, errTooLarge):
 			http.Error(w, "file too large\n", http.StatusRequestEntityTooLarge)
-			return
+		case errors.Is(err, errBadMultipart):
+			http.Error(w, "malformed multipart body\n", http.StatusBadRequest)
+		default:
+			logLine("upload ip=%s err=%v", ip, err)
+			http.Error(w, "upload failed\n", http.StatusInternalServerError)
 		}
-		logLine("upload ip=%s err=%v", ip, err)
-		http.Error(w, "upload failed\n", http.StatusInternalServerError)
 		return
 	}
 	if meta == nil {
@@ -196,7 +328,7 @@ func (s *server) upload(w http.ResponseWriter, r *http.Request) {
 	logLine("upload ip=%s id=%s name=%q size=%d stored=%d gzip=%v",
 		ip, meta.ID, meta.Filename, meta.Size, meta.StoredSize, meta.Gzipped)
 
-	if strings.Contains(r.Header.Get("Accept"), "application/json") {
+	if acceptsJSON(r) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"url":        dl,
@@ -211,12 +343,15 @@ func (s *server) upload(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, dl)
 }
 
-var errTooLarge = errors.New("file too large")
+var (
+	errTooLarge     = errors.New("file too large")
+	errBadMultipart = errors.New("malformed multipart body")
+)
 
 func (s *server) saveMultipart(w http.ResponseWriter, r *http.Request, limit int64) (string, *Meta, error) {
 	mr, err := r.MultipartReader()
 	if err != nil {
-		return "", nil, err
+		return "", nil, fmt.Errorf("%w: %w", errBadMultipart, err)
 	}
 	var name string
 	var meta *Meta
@@ -226,7 +361,7 @@ func (s *server) saveMultipart(w http.ResponseWriter, r *http.Request, limit int
 			break
 		}
 		if err != nil {
-			return "", nil, err
+			return "", nil, fmt.Errorf("%w: %w", errBadMultipart, err)
 		}
 		if meta == nil && p.FileName() != "" {
 			name = sanitizeName(r.URL.Query().Get("filename"))
@@ -285,6 +420,10 @@ func (s *server) save(src io.Reader, name string, limit int64) (*Meta, error) {
 	if limit > 0 && n > limit {
 		return nil, cleanup(errTooLarge)
 	}
+	if err := tmp.Sync(); err != nil {
+		os.Remove(tmpName)
+		return nil, err
+	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpName)
 		return nil, err
@@ -321,6 +460,23 @@ func (s *server) download(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found\n", http.StatusNotFound)
 		return
 	}
+
+	// JSON clients get record metadata instead of the bytes.
+	if acceptsJSON(r) && r.Method == http.MethodGet {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"id":        m.ID,
+			"filename":  m.Filename,
+			"size":      m.Size,
+			"sha256":    m.SHA256,
+			"downloads": m.Downloads,
+			"created":   m.Created.UTC().Format(time.RFC3339),
+			"expires":   m.Expires.UTC().Format(time.RFC3339),
+			"gzipped":   m.Gzipped,
+		})
+		return
+	}
+
 	f, err := os.Open(s.store.blobPath(id))
 	if err != nil {
 		http.Error(w, "not found\n", http.StatusNotFound)
@@ -334,8 +490,19 @@ func (s *server) download(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", `attachment; filename="`+m.Filename+`"`)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "private, max-age=86400")
+	w.Header().Set("ETag", `W/"`+m.SHA256+`"`)
+	w.Header().Set("Content-Security-Policy", "sandbox")
 	if m.Gzipped {
 		w.Header().Set("Vary", "Accept-Encoding")
+	}
+	if r.TLS != nil {
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+	}
+
+	if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+		etagMatches(r.Header.Get("If-None-Match"), m.SHA256) {
+		w.WriteHeader(http.StatusNotModified)
+		return
 	}
 
 	switch {
@@ -371,7 +538,7 @@ func (s *server) del(w http.ResponseWriter, r *http.Request) {
 	if key == "" {
 		key = r.Header.Get("X-Delete-Key")
 	}
-	if key == "" || subtle.ConstantTimeCompare([]byte(key), []byte(m.DeleteKey)) != 1 {
+	if key == "" || !constTimeEq(key, m.DeleteKey) {
 		http.Error(w, "forbidden\n", http.StatusForbidden)
 		return
 	}

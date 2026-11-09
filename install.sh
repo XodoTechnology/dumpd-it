@@ -34,8 +34,13 @@ UPLOAD_ALLOW="${UPLOAD_ALLOW:-}"
 
 # --- Optional knobs --------------------------------------------------------
 # UNLOCK_KEY="s3cret"                 # allows unlimited upload size via ?key=
+# Prefer [A-Za-z0-9._~-] - exotic chars can be mangled by .env parsing.
 UNLOCK_KEY="${UNLOCK_KEY:-}"
 MAX_UPLOAD_MB="${MAX_UPLOAD_MB:-10240}"
+# MIN_FREE_MB="1024"                  # refuse uploads below this free disk (0=off)
+MIN_FREE_MB="${MIN_FREE_MB:-}"
+# PROXY_HOPS="1"                      # trusted proxies appending X-Forwarded-For
+PROXY_HOPS="${PROXY_HOPS:-}"
 TTL="${TTL:-168h}"                    # rolling expiry, renewed on access
 # BASE_URL="https://files.example.com"  # override generated URLs (rarely needed)
 BASE_URL="${BASE_URL:-}"
@@ -93,7 +98,7 @@ fi
 ########################## prompt: upload allowlist #########################
 if [[ -z "$UPLOAD_ALLOW" ]]; then
     ssh_ip="$(echo "${SSH_CONNECTION:-}" | awk '{print $1}')"
-    [[ -n "$ssh_ip" ]] || ssh_ip="$(who -u 2>/dev/null | awk 'match($0,/\(([0-9.]+)\)/,m){print m[1]}' | head -1)"
+    [[ -n "$ssh_ip" ]] || ssh_ip="$(who -u 2>/dev/null | grep -oE '\([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\)' | head -1 | tr -d '()')"
     def="${ssh_ip:-127.0.0.1}"
     if [[ -t 0 ]]; then
         read -rp "IP(s)/CIDR(s) allowed to upload [${def}]: " ans
@@ -104,6 +109,9 @@ if [[ -z "$UPLOAD_ALLOW" ]]; then
     fi
 fi
 c "upload allowlist: $UPLOAD_ALLOW"
+if [[ -n "$UNLOCK_KEY" && "$UNLOCK_KEY" =~ [^A-Za-z0-9._~-] ]]; then
+    warn "UNLOCK_KEY has unusual characters - .env parsing may mangle it; prefer [A-Za-z0-9._~-]"
+fi
 
 ############################# install docker ###############################
 if ! command -v docker >/dev/null 2>&1; then
@@ -128,7 +136,7 @@ c "installing app to $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 cp -f "$SCRIPT_DIR"/*.go "$SCRIPT_DIR"/go.mod "$SCRIPT_DIR"/go.sum \
       "$SCRIPT_DIR"/Dockerfile "$SCRIPT_DIR"/.dockerignore "$SCRIPT_DIR"/README.md \
-      "$INSTALL_DIR"/ 2>/dev/null || true
+      "$INSTALL_DIR"/
 
 # .env — passed to the container via env_file.
 # Back up any existing one first in case it was hand-edited.
@@ -139,6 +147,8 @@ fi
     echo "UPLOAD_ALLOW=$UPLOAD_ALLOW"
     echo "BEHIND_PROXY=$BEHIND_PROXY"
     echo "MAX_UPLOAD_MB=$MAX_UPLOAD_MB"
+    [[ -n "$MIN_FREE_MB" ]] && echo "MIN_FREE_MB=$MIN_FREE_MB"
+    [[ -n "$PROXY_HOPS" ]] && echo "PROXY_HOPS=$PROXY_HOPS"
     echo "TTL=$TTL"
     [[ -n "$BASE_URL" ]]    && echo "BASE_URL=$BASE_URL"
     [[ -n "$UNLOCK_KEY" ]]  && echo "UNLOCK_KEY=$UNLOCK_KEY"
@@ -162,10 +172,18 @@ services:
   dumpd:
     build: .
     restart: unless-stopped
+    stop_grace_period: 30s
     ports:
 $PORTS
     sysctls:
       - net.ipv4.ip_unprivileged_port_start=0
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
     env_file: .env
     volumes:
       - dumpd-data:/data

@@ -1,2 +1,5 @@
 data/
 dumpd
+.env
+.env.bak
+*.local
